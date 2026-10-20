@@ -52,6 +52,7 @@ import type {
 import { Key, Text, isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.ts";
 import { classifyGuardedCommand, evaluateGuardedCommand, guardedCommandPreview, guardedCommandTitle, loadRuntimeGuardrailsConfig, yoloConfiguredRestriction } from "../lib/runtime-guardrails-policy.ts";
+import { evaluateSensitivePathTool } from "../lib/sensitive-path-guard.ts";
 import { isRecord } from "../lib/record-guard.ts";
 import {
 	BACKGROUND_SUBAGENTS_FILE,
@@ -1323,26 +1324,6 @@ function headlessDeliveryNote(hostMode: string | undefined): string {
 	return "\n\nNo human can answer questions in this session. For the ask-on-risk delivery question, do not ask: use `feature-branch-chain`, record that choice in the feature document's `## Log`, and continue. Consent, maintenance, and opaque-token prompts keep their own rules.";
 }
 
-const PATH_GUARDED_TOOL_NAMES = new Set(["read", "write", "edit"]);
-const PATH_INPUT_KEYS = new Set([
-	"path",
-	"paths",
-	"file",
-	"files",
-	"filePath",
-	"filePaths",
-]);
-const SENSITIVE_PATH_PATTERNS: RegExp[] = [
-	/(^|\/)\.ssh(?:\/|$)/,
-	/(^|\/)\.credentials(?:\/|$)/,
-	/(^|\/)library\/keychains(?:\/|$)/,
-	/(^|\/)\.aws\/credentials$/,
-	/(^|\/)\.config\/gh\/hosts\.ya?ml$/,
-	/(^|\/)secrets(?:\/|$)/,
-	/(^|\/)\.env(?:$|[./_-])/,
-	/\.(?:pem|key|p12|pfx)$/,
-];
-
 const JUDGMENT_DAY_AGENT_NAMES = [
 	"jd-judge-a",
 	"jd-judge-b",
@@ -1411,24 +1392,6 @@ function isNamedAgentStartEvent(event: unknown): boolean {
 	return readAgentStartNames(event).length > 0;
 }
 
-function normalizePolicyPath(value: string): string {
-	return value.trim().replace(/^~(?=\/|$)/, homedir()).replace(/\\/g, "/").toLowerCase();
-}
-
-function isSensitivePath(value: string): boolean {
-	const normalized = normalizePolicyPath(value);
-	return SENSITIVE_PATH_PATTERNS.some((pattern) => pattern.test(normalized));
-}
-
-function collectPathInputs(value: unknown, key?: string): string[] {
-	if (typeof value === "string") return key && PATH_INPUT_KEYS.has(key) ? [value] : [];
-	if (Array.isArray(value)) return value.flatMap((item) => collectPathInputs(item, key));
-	if (!isRecord(value)) return [];
-	return Object.entries(value).flatMap(([entryKey, entryValue]) =>
-		collectPathInputs(entryValue, entryKey),
-	);
-}
-
 function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	try {
 		const getActiveTools = (pi as unknown as { getActiveTools?: () => unknown[] })
@@ -1447,19 +1410,6 @@ function hasWritableEngramTool(pi: ExtensionAPI): boolean {
 	} catch {
 		return false;
 	}
-}
-
-function evaluateSensitivePathTool(
-	toolName: string,
-	input: unknown,
-): ToolCallEventResult | undefined {
-	if (!PATH_GUARDED_TOOL_NAMES.has(toolName)) return undefined;
-	const sensitivePath = collectPathInputs(input).find(isSensitivePath);
-	if (!sensitivePath) return undefined;
-	return {
-		block: true,
-		reason: `Gentle AI safety policy blocked access to sensitive path: ${sanitizeTerminalText(sensitivePath)}. Ask the user for an explicit safer plan.`,
-	};
 }
 
 const ASK_USER_CHOICE_BLOCKED_EVENT = "gentle-pi:ask-user-choice:blocked";
