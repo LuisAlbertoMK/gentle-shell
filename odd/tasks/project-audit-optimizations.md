@@ -83,7 +83,7 @@ commits before proposing work.
 
 ### Structural
 
-- `extensions/gentle-ai.ts` at 10,258 lines is larger than the entire `runtime/` area and is the
+- `extensions/gentle-ai.ts` at 10,284 lines (10,827 before this branch) is larger than the entire `runtime/` area and is the
   single biggest refactor and review-risk candidate in the tree.
 - The render hot path is well instrumented already, which makes it the cheapest area to change
   safely: `scripts/render-cache-performance.mjs` plus `scripts/render-cache-performance-worker.mjs`
@@ -123,13 +123,18 @@ otherwise idle machine; the timing numbers are unusable next to live agent sessi
    sidebar digest, and skip a pulse render when the visible frame cannot change. Measurable with the
    paired harness. Highest value, needs the harness for a defensible claim.
 2. **`extensions/gentle-ai.ts` decomposition** — extract cohesive units, keeping behaviour identical
-   and gates green. Large, must be sliced to stay reviewable. Two slices delivered.
+   and gates green. Large, must be sliced to stay reviewable. Three slices delivered.
    `d0ba917cf` moved the Judgment Day fix-dispatch authorization to
    `lib/judgment-day-dispatch.ts` (164 lines out of the monolith) and added a 9-case suite, because
    that authorization had no direct coverage at all. `229b51d21` moved the guard vocabulary and the
    YOLO reversibility analysis to `lib/runtime-guardrails-analysis.ts` (113 lines), where the
-   existing seven guard suites already pinned the behaviour. Coverage is uneven across the
-   monolith: guard and YOLO are well covered, the Judgment Day dispatch was not.
+   existing seven guard suites already pinned the behaviour. `dc3ea6fac` moved the rest of the
+   guardrails core — patterns, evaluation, config loading, confirmation copy and
+   `yoloConfiguredRestriction` — to `lib/runtime-guardrails-policy.ts` (267 lines); `gentleAiConfigHome()`
+   turned out to be a pure pass-through of the lib-owned `gentlePiConfigHome()`, so the planned
+   config-home move was unnecessary, and the three copies of `isRecord` collapsed into
+   `lib/record-guard.ts`. Coverage is uneven across the monolith: guard and YOLO are well covered,
+   the Judgment Day dispatch was not.
 3. **`sessionCost`/`sessionStats` hardening** — extend the memoization fingerprint only if a real
    uncached path is found; today the cache looks correct and should be left alone.
 
@@ -138,6 +143,6 @@ otherwise idle machine; the timing numbers are unusable next to live agent sessi
 - The full `tests/*.test.ts` suite does not terminate on this Windows host (>40 min) and
   `tests/review-candidate-view.test.ts` hangs on its own; both are pre-existing and unrelated to
   this branch. Verification here relies on targeted suites plus the repo's gates.
-- No claim in this document is measured yet: everything above is source-verified, and only the first
-  decomposition slice is delivered. The render residual stays unmeasured because the paired harness
+- No claim in this document is measured yet: everything above is source-verified, and three
+  decomposition slices are delivered. The render residual stays unmeasured because the paired harness
   cannot run on this host (see Status above).
