@@ -1,4 +1,5 @@
 import { allowedEditSurfaces as hasTaskScopedAllowedEditSurfaces } from "./bounded-writer-admission.ts";
+import { isRecord } from "./record-guard.ts";
 import { canonicalHash } from "./review-transaction.ts";
 
 const JUDGMENT_DAY_FIX_AGENT_NAME = "jd-fix-agent";
@@ -7,10 +8,6 @@ const JUDGMENT_DAY_ACTIVATION_SENTENCE = "User explicitly requested Judgment Day
 const JUDGMENT_DAY_AUTHORIZED_SEVERE_IDS_HEADING = "## Exact authorized severe IDs";
 const JUDGMENT_DAY_CORRECTION_BATCH_HEADING = "## Judgment Day correction batch";
 const JUDGMENT_DAY_FROZEN_FINDING_ROWS_HEADING = "## Exact frozen finding rows";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export function hasJudgmentDayFixAgentReference(input: Record<string, unknown>): boolean {
 	return input.agent === JUDGMENT_DAY_FIX_AGENT_NAME ||
