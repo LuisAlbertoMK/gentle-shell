@@ -29,6 +29,9 @@ any code is written, because two previously "free" issues turned out to be alrea
 | `docs/` | 38 | — |
 | `odd/` (task records) | 147 | — |
 
+Counts are non-blank lines (`Measure-Object -Line` semantics), so they run a few percent under raw
+line counts: `extensions/gentle-ai.ts` is 10,827 raw lines, not 10,258.
+
 Largest single files, which are the real review risk: `extensions/gentle-ai.ts` (10,258),
 `lib/review-integration-v2.ts` (2,798), `extensions/gentle-shell.ts` (2,549),
 `lib/native-review-cli.ts` (2,534), `extensions/gentle-agents.ts` (2,354).
@@ -106,13 +109,23 @@ process replicas, which is far too slow for an interactive loop. Use small `--co
 `--styles`, `--samples` and `--repetitions` for a smoke run and keep the full matrix for the real
 claim.
 
+Status: the harness is **not runnable here**. It asserts Pi exactly `1.1.0`
+(`render-cache-performance-worker.mjs:11-12`) while the installed host is Pi `1.2.0` / pi-tui `1.2.0`,
+so it fails closed by design; `--pi-root` also has to be a Pi install root carrying `dist/` and a
+`node_modules/@earendil-works/` with pi-tui, pi-ai, pi-agent-core and jiti. On top of that,
+`tests/render-cache-performance.test.ts:39` fails on this host with `EPERM` when it creates a symlink.
+Measuring a render change therefore needs the harness revived (pin Pi 1.1.0 in a scratch root) and an
+otherwise idle machine; the timing numbers are unusable next to live agent sessions.
+
 ## Ranked backlog (verified open)
 
 1. **Render pulse residual (#994)** — reuse the per-frame bar model between the render and the
    sidebar digest, and skip a pulse render when the visible frame cannot change. Measurable with the
    paired harness. Highest value, needs the harness for a defensible claim.
 2. **`extensions/gentle-ai.ts` decomposition** — extract cohesive units, keeping behaviour identical
-   and gates green. Large, must be sliced to stay reviewable.
+   and gates green. Large, must be sliced to stay reviewable. First slice delivered in `d0ba917cf`:
+   the Judgment Day fix-dispatch authorization moved to `lib/judgment-day-dispatch.ts` (164 lines out
+   of the monolith) and gained a 9-case suite, because that authorization had no direct coverage.
 3. **`sessionCost`/`sessionStats` hardening** — extend the memoization fingerprint only if a real
    uncached path is found; today the cache looks correct and should be left alone.
 
@@ -121,5 +134,6 @@ claim.
 - The full `tests/*.test.ts` suite does not terminate on this Windows host (>40 min) and
   `tests/review-candidate-view.test.ts` hangs on its own; both are pre-existing and unrelated to
   this branch. Verification here relies on targeted suites plus the repo's gates.
-- No claim in this document is measured yet: everything above is source-verified, and the backlog is
-  ranked, not delivered.
+- No claim in this document is measured yet: everything above is source-verified, and only the first
+  decomposition slice is delivered. The render residual stays unmeasured because the paired harness
+  cannot run on this host (see Status above).
