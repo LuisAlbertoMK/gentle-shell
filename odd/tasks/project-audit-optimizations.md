@@ -117,6 +117,12 @@ so it fails closed by design; `--pi-root` also has to be a Pi install root carry
 Measuring a render change therefore needs the harness revived (pin Pi 1.1.0 in a scratch root) and an
 otherwise idle machine; the timing numbers are unusable next to live agent sessions.
 
+The blocker is filed upstream as #2411, documenting the exact version gate, the misleading
+`piRoot/package.json` error, the `--pi-root` layout requirements and the Windows symlink test
+together. Upstream confirms no later commit ever touched the harness and no issue had reported it, so
+this is a new report rather than a duplicate. It needs `status:approved` before a fixing PR is
+acceptable.
+
 ## Ranked backlog (verified open)
 
 1. **Render pulse residual (#994)** — reuse the per-frame bar model between the render and the
