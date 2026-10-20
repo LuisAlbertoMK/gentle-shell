@@ -148,6 +148,34 @@ otherwise idle machine; the timing numbers are unusable next to live agent sessi
 3. **`sessionCost`/`sessionStats` hardening** — extend the memoization fingerprint only if a real
    uncached path is found; today the cache looks correct and should be left alone.
 
+## Delivery status
+
+This branch is **local only**. It has no remote and no PR: ten commits sit on
+`chore/project-audit-optimizations`, ten ahead of `upstream/main`, and `main` carries none of them. The
+audit is evidence, not a delivery vehicle.
+
+The only upstream-facing artifact of this work is PR #2394 on
+`fix/changes-watcher-orphan-git-tree`, which fixes #927 and is independent of this branch. Upstream
+requires an approved issue (`status:approved`) before a PR is accepted, so landing any slice from this
+branch needs its own approved issue first. That is why the decomposition stopped at four slices
+instead of continuing into `confirmCommand`.
+
+Two repositories are in play and they are not the same: `origin` is the fork
+(`LuisAlbertoMK/gentle-shell`) and its `main` is two commits ahead of `upstream/main` from a
+fork-only PR that merged `docs/bench-fase0`, which is why that directory must stay out of every
+upstream contribution. `upstream` is `Gentleman-Programming/gentle-shell`.
+
+## Verified vs assumed
+
+Verified locally and reproducible on a pristine worktree of the same commit: the typecheck baseline
+stays at 0; the guard/YOLO suites, the Judgment Day dispatch suite and the new sensitive-path suite
+pass; `gentle-ai.test.ts` reports 123 tests, 122 passing, with the single failure pre-existing on
+Windows (OSC 52 `ENOENT`); `runtime-harness` exits 0.
+
+Assumed, not measured: every performance claim. Nothing here has a benchmark number behind it. The
+render residual (#994) remains a source-level hypothesis until the paired harness runs, and the
+harness cannot run on this host today.
+
 ## Limits
 
 - The full `tests/*.test.ts` suite does not terminate on this Windows host (>40 min) and
