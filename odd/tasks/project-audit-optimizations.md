@@ -123,9 +123,13 @@ otherwise idle machine; the timing numbers are unusable next to live agent sessi
    sidebar digest, and skip a pulse render when the visible frame cannot change. Measurable with the
    paired harness. Highest value, needs the harness for a defensible claim.
 2. **`extensions/gentle-ai.ts` decomposition** — extract cohesive units, keeping behaviour identical
-   and gates green. Large, must be sliced to stay reviewable. First slice delivered in `d0ba917cf`:
-   the Judgment Day fix-dispatch authorization moved to `lib/judgment-day-dispatch.ts` (164 lines out
-   of the monolith) and gained a 9-case suite, because that authorization had no direct coverage.
+   and gates green. Large, must be sliced to stay reviewable. Two slices delivered.
+   `d0ba917cf` moved the Judgment Day fix-dispatch authorization to
+   `lib/judgment-day-dispatch.ts` (164 lines out of the monolith) and added a 9-case suite, because
+   that authorization had no direct coverage at all. `229b51d21` moved the guard vocabulary and the
+   YOLO reversibility analysis to `lib/runtime-guardrails-analysis.ts` (113 lines), where the
+   existing seven guard suites already pinned the behaviour. Coverage is uneven across the
+   monolith: guard and YOLO are well covered, the Judgment Day dispatch was not.
 3. **`sessionCost`/`sessionStats` hardening** — extend the memoization fingerprint only if a real
    uncached path is found; today the cache looks correct and should be left alone.
 
