@@ -135,6 +135,13 @@ otherwise idle machine; the timing numbers are unusable next to live agent sessi
    config-home move was unnecessary, and the three copies of `isRecord` collapsed into
    `lib/record-guard.ts`. Coverage is uneven across the monolith: guard and YOLO are well covered,
    the Judgment Day dispatch was not.
+   The next unit is the sensitive-path guard (`PATH_GUARDED_TOOL_NAMES`, `PATH_INPUT_KEYS`,
+   `SENSITIVE_PATH_PATTERNS`, `readStringPath`, `normalizePolicyPath`, `isSensitivePath`,
+   `collectPathInputs`, `evaluateSensitivePathTool`, roughly 138 lines). It is **the one security
+   boundary in the monolith with no coverage at all**: `autonomous-guard.test.ts` only imports
+   `__testing`, which does not expose these symbols, and the `.ssh`/`credentials` assertions in
+   `auto-permission-evidence.test.ts` exercise a different module. Extract it together with a suite,
+   never on the strength of neighbouring suites.
 3. **`sessionCost`/`sessionStats` hardening** — extend the memoization fingerprint only if a real
    uncached path is found; today the cache looks correct and should be left alone.
 
