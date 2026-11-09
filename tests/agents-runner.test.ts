@@ -34,7 +34,7 @@ interface Harness {
 	advance(ms: number): void;
 }
 
-function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boolean; process?: RunnerDeps["process"]; pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
+function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boolean; process?: RunnerDeps["process"]; pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; cleanupTimeoutMs?: number; drainTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; exitOnStdinEnd?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"]; onFallback?: RunnerHooks["onFallback"]; reject?: (command: Record<string, unknown>) => boolean; hold?: (command: Record<string, unknown>) => boolean } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -48,14 +48,16 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 		spawn: (command, args, launchOptions) => {
 			if (options.failStart) throw new Error("fixture spawn failed");
 			spawnOptions.push({ command, args, env: launchOptions.env, stdio: launchOptions.stdio });
-			const fake = fakeChild({ exitOnKill: options.exitOnKill, pid: options.pid });
+			const fake = fakeChild({ exitOnKill: options.exitOnKill, exitOnStdinEnd: options.exitOnStdinEnd, pid: options.pid });
 			if (options.state !== undefined) {
 				fake.child.stdin.removeAllListeners("data");
 				fake.child.stdin.on("data", (chunk) => {
 					const command = JSON.parse(String(chunk));
 					fake.written.push(command);
-					fake.emit({ type: "response", id: command.id, success: command.type !== "get_state" || options.stateSuccess !== false,
-						data: command.type === "get_state" ? options.state : undefined });
+					if (options.hold?.(command)) return;
+					const rejected = options.reject?.(command) === true;
+					fake.emit({ type: "response", id: command.id, success: !rejected && (command.type !== "get_state" || options.stateSuccess !== false),
+						...(rejected ? { error: "No API key for provider" } : {}), data: command.type === "get_state" ? options.state : undefined });
 				});
 			}
 			children.push(fake);
@@ -73,7 +75,7 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 		pi: { command: "pi", args: [] },
 	};
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000, toolStallTimeoutMs: options.toolStallTimeoutMs }, deps, {
+	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000, toolStallTimeoutMs: options.toolStallTimeoutMs, cleanupTimeoutMs: options.cleanupTimeoutMs, drainTimeoutMs: options.drainTimeoutMs }, deps, {
 		askUser: async (taskId, ask) => {
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
@@ -81,6 +83,7 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 		onFinish: (task, observations) => { finishes.push(task.id); options.onFinish?.(task, observations); },
 		onNotification: options.onNotification,
 		onSuccessfulMutation: options.onSuccessfulMutation,
+		onFallback: options.onFallback,
 	});
 	return { store, runner, children, timers, asks, finishes, spawnOptions, advance(ms) {
 		clock += ms;
@@ -94,6 +97,107 @@ function harness(options: { resolvePi?: RunnerDeps["resolvePi"]; failStart?: boo
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const mode of [AGENT_MODE.TASK, AGENT_MODE.BACKGROUND]) {
+	for (const policy of [undefined, "off", "malformed"] as const) {
+		test(`background capability admission rejects ${mode} with ${policy ?? "default"} policy`, async (t) => {
+			const root = fs.mkdtempSync(join(tmpdir(), "admission-"));
+			t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+			const config = join(root, "config");
+			const file = join(config, "background-subagents.json");
+			fs.mkdirSync(config);
+			const raw = policy === "malformed" ? "{broken" : JSON.stringify({ schema: "gentle-pi.background-subagents/v1", policy });
+			if (policy) fs.writeFileSync(file, raw);
+			const h = harness({ maxConcurrency: 1 });
+			let launches = 0;
+			const env = { GENTLE_PI_CONFIG_HOME: config, ...(policy === "malformed" ? { GENTLE_PI_BACKGROUND_SUBAGENTS: "on" } : {}) };
+			const task = h.runner.run(request({ cwd: root, env, mode, agent: { ...explorer, tools: ["read", "bash_background"] }, onLaunch: () => { launches++; } }));
+			await tick();
+			assert.equal(h.store.get(task.id)?.status, TASK_STATUS.FAILED);
+			const target = policy ? file : join(root, ".pi", "gentle-ai", "background-subagents.json");
+			assert.equal(h.store.get(task.id)?.error, `could not start pi: explicit tool bash_background requires background-subagents policy on. Set ${target} to {"schema":"gentle-pi.background-subagents/v1","policy":"on"}; inspect or change policy with /gentle:background-subagents enable|disable|status.`);
+			assert.equal(h.children.length, 0);
+			assert.equal(h.spawnOptions.length, 0);
+			assert.equal(h.timers.length, 0);
+			assert.equal(launches, 0);
+			assert.deepEqual(h.finishes, [task.id]);
+			assert.equal((await h.runner.waitFor(task.id)).status, TASK_STATUS.FAILED);
+			assert.equal(existsSync(file), policy !== undefined);
+			if (policy) assert.equal(readFileSync(file, "utf8"), raw);
+			const next = h.runner.run(request({ cwd: root, env }));
+			await tick();
+			assert.equal(h.store.get(next.id)?.status, TASK_STATUS.RUNNING);
+			h.runner.cancel(next.id);
+			await tick();
+		});
+	}
+}
+
+for (const { tools, policy } of [
+	...[undefined, "off"].flatMap(policy => [["read", "unknown_tool"], []].map(tools => ({ tools, policy }))),
+	{ tools: ["read", "bash_background", "grep"], policy: "on" },
+]) {
+	test(`background capability admission preserves launch for ${tools.join(",") || "default tools"} with ${policy ?? "default off"} policy`, async (t) => {
+		const root = fs.mkdtempSync(join(tmpdir(), "admission-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const h = harness();
+		const env = { GENTLE_PI_CONFIG_HOME: join(root, "config"), ...(policy === undefined ? {} : { GENTLE_PI_BACKGROUND_SUBAGENTS: policy }), KEEP: "yes" };
+		const task = h.runner.run(request({ cwd: root, env, agent: { ...explorer, tools } }));
+		await tick();
+		assert.equal(h.store.get(task.id)?.status, TASK_STATUS.RUNNING);
+		assert.equal(h.store.get(task.id)?.error, null);
+		assert.equal(h.children.length, 1);
+		const expected = tools.length ? [...tools, "subagent_parent_message"].join(",") : undefined;
+		assert.equal(h.spawnOptions[0].env[REQUESTED_TOOLS_ENV], expected);
+		assert.equal(h.spawnOptions[0].env.KEEP, "yes");
+		assert.deepEqual(h.spawnOptions[0].args, childArguments(request({ cwd: root, env, agent: { ...explorer, tools } })));
+		assert.equal(h.timers.filter(timer => !timer.cancelled).length, 1);
+		h.runner.cancel(task.id);
+		await tick();
+	});
+}
+
+test("background capability admission refreshes project policy when queued work dispatches", async (t) => {
+	const root = fs.mkdtempSync(join(tmpdir(), "admission-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const dir = join(root, ".pi", "gentle-ai");
+	fs.mkdirSync(dir, { recursive: true });
+	const file = join(dir, "background-subagents.json");
+	const h = harness({ maxConcurrency: 1 });
+	const env = { GENTLE_PI_CONFIG_HOME: join(root, "config"), GENTLE_PI_BACKGROUND_SUBAGENTS: "on" };
+	const first = h.runner.run(request({ cwd: root, env }));
+	const queued = h.runner.run(request({ cwd: root, env, agent: { ...explorer, tools: ["bash_background"] } }));
+	await tick();
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.QUEUED);
+	const raw = '{"schema":"gentle-pi.background-subagents/v1","policy":"off"}';
+	fs.writeFileSync(file, raw);
+	h.runner.cancel(first.id);
+	await tick();
+	assert.equal(h.store.get(queued.id)?.status, TASK_STATUS.FAILED);
+	assert.equal(h.store.get(queued.id)?.error, `could not start pi: explicit tool bash_background requires background-subagents policy on. Set ${file} to {"schema":"gentle-pi.background-subagents/v1","policy":"on"}; inspect or change policy with /gentle:background-subagents enable|disable|status.`);
+	assert.equal(h.children.length, 1);
+	assert.equal(readFileSync(file, "utf8"), raw);
+});
+
+for (const { tools, forwarded } of [
+	{ tools: ["read", "bash_background"], forwarded: true },
+	{ tools: ["read", "bash_background", "job_list", "job_stop"], forwarded: true },
+	{ tools: ["read", "grep"], forwarded: false },
+	{ tools: [], forwarded: false },
+]) {
+	test(`background capability forwards the child job marker only for a declared bash_background (${tools.join(",") || "default tools"})`, async (t) => {
+		const root = fs.mkdtempSync(join(tmpdir(), "child-jobs-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const h = harness();
+		const env = { GENTLE_PI_CONFIG_HOME: join(root, "config"), GENTLE_PI_BACKGROUND_SUBAGENTS: "on" };
+		const task = h.runner.run(request({ cwd: root, env, agent: { ...explorer, tools } }));
+		await tick();
+		assert.equal(h.store.get(task.id)?.status, TASK_STATUS.RUNNING);
+		assert.equal(h.spawnOptions[0].env.GENTLE_PI_AGENTS_CHILD_JOBS, forwarded ? "1" : undefined);
+		h.runner.cancel(task.id);
+		await tick();
+	});
+}
 
 const FOUR_MIN_MS = 4 * 60_000;
 
@@ -891,6 +995,88 @@ test("runner resolves the pi command at each spawn after the entry disappears", 
 	assert.deepEqual(h.spawnOptions[1].args, childArguments(request()));
 });
 
+test("piCommand fallback on win32 re-resolves cli.js via pi.cmd from PATH without shell (#2887)", () => {
+	const procWin = {
+		execPath: "C:\\Program Files\\nodejs\\node.exe",
+		argv: ["C:\\Program Files\\nodejs\\node.exe", "C:\\pnpm\\global\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js"],
+		env: { Path: "C:\\pnpm;C:\\Windows\\System32" },
+		platform: "win32" as const,
+	};
+	const newCli = "C:\\pnpm\\global\\5\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js";
+	const cmdContent = `@ECHO off\r\nnode "${newCli}" %*\r\n`;
+	const exists = (p: string) => p === "C:\\pnpm\\pi.cmd" || p === newCli;
+	const readFile = (p: string) => (p === "C:\\pnpm\\pi.cmd" ? cmdContent : "");
+
+	// While original cli.js still exists, reuses it
+	assert.deepEqual(piCommand(procWin, (p) => p === procWin.argv[1]), { command: procWin.execPath, args: [procWin.argv[1]] });
+	// When original cli.js disappears after upgrade, resolves the new cli.js from pi.cmd on PATH
+	assert.deepEqual(piCommand(procWin, exists, readFile), { command: procWin.execPath, args: [newCli] });
+});
+
+test("piCommand resolves npm and pnpm cmd-shims with relative paths on win32 (#2887)", () => {
+	const procWin = {
+		execPath: "C:\\Program Files\\nodejs\\node.exe",
+		argv: ["C:\\Program Files\\nodejs\\node.exe", "C:\\missing\\cli.js"],
+		env: { PATH: "C:\\AppData\\npm" },
+		platform: "win32" as const,
+	};
+	// npm cmd-shim style with %dp0%
+	const npmShim = `@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js" %*\r\n`;
+	const targetJs = "C:\\AppData\\npm\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\cli.js";
+	const exists = (p: string) => p === "C:\\AppData\\npm\\pi.cmd" || p === targetJs;
+	const readFile = (p: string) => (p === "C:\\AppData\\npm\\pi.cmd" ? npmShim : "");
+
+	assert.deepEqual(piCommand(procWin, exists, readFile), { command: procWin.execPath, args: [targetJs] });
+});
+
+test("piCommand honors GENTLE_PI_AGENTS_PI pointing to a .cmd shim by resolving its JS target (#2887)", () => {
+	const procWin = {
+		execPath: "C:\\Program Files\\nodejs\\node.exe",
+		argv: ["C:\\Program Files\\nodejs\\node.exe", "C:\\missing\\cli.js"],
+		env: { GENTLE_PI_AGENTS_PI: "C:\\custom\\pi.cmd --model gpt-5" },
+		platform: "win32" as const,
+	};
+	const customShim = `@ECHO off\r\nnode "%~dp0pi-launcher.js" %*\r\n`;
+	const targetLauncher = "C:\\custom\\pi-launcher.js";
+	const exists = (p: string) => p === "C:\\custom\\pi.cmd" || p === targetLauncher;
+	const readFile = (p: string) => (p === "C:\\custom\\pi.cmd" ? customShim : "");
+
+	assert.deepEqual(piCommand(procWin, exists, readFile), {
+		command: procWin.execPath,
+		args: [targetLauncher, "--model", "gpt-5"],
+	});
+});
+
+test("runner spawns fallback pi through Node on win32 after upgrade without shell (#2887)", async () => {
+	let existsOld = true;
+	const newCli = "C:\\pnpm\\dist\\cli.js";
+	const procWin = {
+		execPath: "C:\\Program Files\\nodejs\\node.exe",
+		argv: ["C:\\Program Files\\nodejs\\node.exe", "C:\\pi\\dist\\cli.js"],
+		env: { Path: "C:\\pnpm" },
+		platform: "win32" as const,
+	};
+	const cmdContent = `@ECHO off\r\nnode "%~dp0dist\\cli.js" %*\r\n`;
+	const exists = (p: string) => (existsOld && p === procWin.argv[1]) || p === "C:\\pnpm\\pi.cmd" || p === newCli;
+	const readFile = (p: string) => (p === "C:\\pnpm\\pi.cmd" ? cmdContent : "");
+
+	const h = harness({ resolvePi: () => piCommand(procWin, exists, readFile) });
+	// First run before upgrade
+	h.runner.run(request({ agent: { ...explorer, instructions: "audit & verify | status %VAR%" } }));
+	await tick();
+	assert.equal(h.spawnOptions[0].command, procWin.execPath);
+	assert.equal(h.spawnOptions[0].args[0], procWin.argv[1]);
+
+	// Upgrade: old cli.js disappears, piCommand re-resolves via pi.cmd
+	existsOld = false;
+	h.runner.run(request({ agent: { ...explorer, instructions: "audit & verify | status %VAR%" } }));
+	await tick();
+	assert.equal(h.spawnOptions[1].command, procWin.execPath);
+	assert.equal(h.spawnOptions[1].args[0], newCli);
+	// Arguments with &, |, % and spaces are preserved verbatim in argv, never joined by a shell
+	assert.ok(h.spawnOptions[1].args.includes("audit & verify | status %VAR%"));
+});
+
 test("JsonLines splits on LF only, tolerates CRLF, and skips lines that are not JSON", () => {
 	const seen: unknown[] = [];
 	const lines = new JsonLines((value) => seen.push(value));
@@ -923,7 +1109,8 @@ test("AgentRunner runs a task end to end: prompt, deltas into the store, complet
 	assert.equal(finished?.toolCalls, 1);
 	assert.equal(finished?.sessionPath, "/sessions/child.jsonl");
 	assert.equal(finished?.label, "Map the repo");
-	assert.ok(children[0].killed.length > 0, "the child is stopped once the answer is in");
+	assert.ok(children[0].child.stdin.writableEnded, "the child is stopped via orderly shutdown once the answer is in");
+	assert.equal(children[0].killed.length, 0, "no kill signals sent during orderly settlement");
 	assert.equal(store.thread(task.id).items.length, 2);
 	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
 });
@@ -971,6 +1158,217 @@ test("AgentRunner queues beyond max concurrency and starts the next task when on
 	assert.equal(store.get(first.id)?.status, TASK_STATUS.COMPLETED);
 	assert.equal(children.length, 2);
 	assert.equal(store.get(second.id)?.status, TASK_STATUS.RUNNING);
+});
+
+test("AgentRunner requests orderly shutdown via stdin on settlement and does not send SIGTERM immediately (#1740)", async () => {
+	const { store, runner, children } = harness({ exitOnKill: false });
+	const task = runner.run(request());
+	await tick();
+	assert.equal(children.length, 1);
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+	await tick();
+	assert.equal(children[0].killed.length, 0);
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+
+	// Orderly shutdown must have requested stdin.end()
+	assert.equal(children[0].child.stdin.writableEnded, true, "stdin must be ended on settlement to trigger Pi orderly shutdown");
+	// Must NOT send SIGTERM immediately
+	assert.deepEqual(children[0].killed, [], "SIGTERM must not be sent immediately upon settlement");
+	// Task completion and cleanup in flight should be distinguishable
+	assert.equal(store.get(task.id)?.lastStep, "cleaning up", "lastStep distinguishes in-flight cleanup");
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, "task waits for cleanup exit");
+
+	// Child exits cleanly upon session_shutdown completion
+	children[0].exit(0);
+	await tick();
+	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.COMPLETED);
+	assert.equal(store.get(task.id)?.lastStep, "done");
+	assert.deepEqual(children[0].killed, [], "clean shutdown completes with zero kill signals sent");
+});
+
+test("AgentRunner allows delayed cleanup and cancels escalation after clean exit (#1740)", async () => {
+	// EOF must be independent of kill behavior: this child honors signals but
+	// needs time to finish asynchronous shutdown after its input closes.
+	const { store, runner, children, timers, advance, finishes } = harness({ exitOnStdinEnd: false });
+	const task = runner.run(request());
+	await tick();
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(children[0].child.stdin.writableEnded, true);
+	advance(2_000);
+	await tick();
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING);
+	assert.equal(store.get(task.id)?.lastStep, "cleaning up");
+	assert.deepEqual(children[0].killed, []);
+	assert.deepEqual(finishes, []);
+	children[0].exit(0);
+	await tick();
+	assert.equal((await runner.waitFor(task.id)).status, TASK_STATUS.COMPLETED);
+	assert.equal(store.get(task.id)?.lastStep, "done");
+	assert.deepEqual(finishes, [task.id]);
+	assert.ok(timers.filter((timer) => timer.ms === 5_000).every((timer) => timer.cancelled));
+	advance(5_000);
+	await tick();
+	assert.deepEqual(children[0].killed, []);
+	assert.deepEqual(finishes, [task.id]);
+});
+
+test("AgentRunner escalates to SIGTERM and SIGKILL if orderly cleanup exceeds cleanupTimeoutMs (#1740)", async () => {
+	const { store, runner, children, timers } = harness({ exitOnKill: false, cleanupTimeoutMs: 3000 });
+	const task = runner.run(request());
+	await tick();
+	assert.equal(children.length, 1);
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+	await tick();
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+
+	assert.equal(children[0].child.stdin.writableEnded, true);
+	assert.deepEqual(children[0].killed, []);
+
+	// Find the cleanup timeout timer (3000 ms) and trigger it
+	const cleanupTimer = timers.find((timer) => !timer.cancelled && timer.ms === 3000);
+	assert.ok(cleanupTimer, "cleanup timeout timer must be scheduled");
+	cleanupTimer.fn();
+	await tick();
+
+	// Escalation has fired SIGTERM
+	assert.deepEqual(children[0].killed, ["SIGTERM"]);
+
+	// And termination grace timer (250 ms) is scheduled for SIGKILL
+	const killTimer = timers.find((timer) => !timer.cancelled && timer.ms === 250);
+	assert.ok(killTimer, "SIGKILL escalation timer must be scheduled");
+	killTimer.fn();
+	await tick();
+
+	assert.deepEqual(children[0].killed, ["SIGTERM", "SIGKILL"]);
+});
+
+test("a child that reports a running background job drains one bounded window before the orderly shutdown", async () => {
+	const { store, runner, children, timers, advance } = harness({ exitOnKill: false, drainTimeoutMs: 2_000, cleanupTimeoutMs: 3_000 });
+	const task = runner.run(request({ agent: { ...explorer, tools: ["read", "bash_background"] }, env: { GENTLE_PI_BACKGROUND_SUBAGENTS: "on" } }));
+	await tick();
+	const child = children[0];
+	child.message({ id: "j1", kind: "job", message: JSON.stringify({ running: 1, pending: true }) });
+	assert.deepEqual(child.sent.at(-1), { id: "j1", kind: "ack", accepted: true });
+	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "waiting on CI" }] }] });
+	child.emit({ type: "agent_settled" });
+	await tick();
+
+	// The drain holds the orderly shutdown open; nothing has been signalled yet.
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING);
+	assert.equal(store.get(task.id)?.lastStep, "draining background jobs");
+	assert.equal(child.child.stdin.writableEnded, false, "stdin stays open while the job drains");
+	assert.deepEqual(child.killed, []);
+	const drainTimer = timers.find((timer) => !timer.cancelled && timer.ms === 2_000);
+	assert.ok(drainTimer, "one bounded drain window is scheduled");
+
+	// The bounded window expires: the ordinary orderly shutdown begins and escalates.
+	advance(2_000);
+	await tick();
+	assert.ok(drainTimer!.cancelled);
+	assert.equal(child.child.stdin.writableEnded, true, "the drain is bounded and ends by settling");
+	const cleanupTimer = timers.find((timer) => !timer.cancelled && timer.ms === 3_000);
+	assert.ok(cleanupTimer, "the ordinary cleanup window follows the drain");
+	cleanupTimer!.fn();
+	await tick();
+	assert.deepEqual(child.killed, ["SIGTERM"]);
+	const killTimer = timers.find((timer) => !timer.cancelled && timer.ms === 250);
+	assert.ok(killTimer, "SIGKILL follows the drain like today");
+	killTimer!.fn();
+	await tick();
+	assert.deepEqual(child.killed, ["SIGTERM", "SIGKILL"]);
+});
+
+test("a child job that finishes inside the drain ends it early and only one extension is allowed", async () => {
+	const { store, runner, children, timers } = harness({ exitOnKill: false, drainTimeoutMs: 2_000, cleanupTimeoutMs: 3_000 });
+	const task = runner.run(request({ agent: { ...explorer, tools: ["read", "bash_background"] }, env: { GENTLE_PI_BACKGROUND_SUBAGENTS: "on" } }));
+	await tick();
+	const child = children[0];
+	child.message({ id: "j1", kind: "job", message: JSON.stringify({ running: 1, pending: true }) });
+	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "waiting" }] }] });
+	child.emit({ type: "agent_settled" });
+	await tick();
+	const drainTimer = timers.find((timer) => !timer.cancelled && timer.ms === 2_000)!;
+	assert.ok(drainTimer);
+
+	child.message({ id: "j2", kind: "job", message: JSON.stringify({ running: 0, pending: false }) });
+	await tick();
+	assert.ok(drainTimer.cancelled, "the drain ends early when the child reports no running jobs");
+	assert.equal(child.child.stdin.writableEnded, true);
+
+	// A later report cannot open a second extension.
+	const before = timers.filter((timer) => !timer.cancelled && timer.ms === 2_000).length;
+	child.message({ id: "j3", kind: "job", message: JSON.stringify({ running: 1, pending: true }) });
+	await tick();
+	assert.equal(timers.filter((timer) => !timer.cancelled && timer.ms === 2_000).length, before, "no unbounded re-drain after the first extension");
+});
+
+test("a job frame that is not a valid child state is refused and does not open a drain", async () => {
+	const { runner, children, timers } = harness({ exitOnKill: false, drainTimeoutMs: 2_000 });
+	runner.run(request({ agent: { ...explorer, tools: ["read", "bash_background"] }, env: { GENTLE_PI_BACKGROUND_SUBAGENTS: "on" } }));
+	await tick();
+	const child = children[0];
+	child.message({ id: "j1", kind: "job", message: "not json" });
+	assert.deepEqual(child.sent.at(-1), { id: "j1", kind: "ack", accepted: false, error: "invalid child job state" });
+	child.emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }] });
+	child.emit({ type: "agent_settled" });
+	await tick();
+	assert.equal(child.child.stdin.writableEnded, true, "an unparseable job report does not delay settlement");
+	assert.equal(timers.filter((timer) => !timer.cancelled && timer.ms === 2_000).length, 0);
+});
+
+test("orderly cleanup escalation retains the full exit confirmation deadline after SIGKILL (#1740)", async () => {
+	let groupAlive = true;
+	const { store, runner, children, timers, advance } = harness({
+		exitOnKill: false,
+		pid: 42,
+		cleanupTimeoutMs: 5_000,
+		process: {
+			platform: "linux",
+			kill: () => {
+				if (!groupAlive) throw Object.assign(new Error(), { code: "ESRCH" });
+				return true;
+			},
+		},
+	});
+	const task = runner.run(request());
+	await tick();
+	assert.equal(children.length, 1);
+	children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }] });
+	await tick();
+	children[0].emit({ type: "agent_settled" });
+	await tick();
+
+	// Advance time by the cleanup window (5000 ms)
+	const cleanupTimer = timers.find((t) => !t.cancelled && t.ms === 5_000);
+	assert.ok(cleanupTimer, "cleanup timeout timer must be scheduled");
+	advance(5_000);
+	await tick();
+
+	// Advance time by termination grace (250 ms)
+	const killTimer = timers.find((t) => !t.cancelled && t.ms === 250);
+	assert.ok(killTimer, "SIGKILL timer must be scheduled");
+	advance(250);
+	await tick();
+
+	// After SIGKILL, confirmGroupExit checks the process group. Because cleanupDeadlineAt was set
+	// at SIGKILL time, it must NOT immediately fail with capacity quarantined!
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.RUNNING, "must not prematurely quarantine after cleanup window");
+	const probeTimer = timers.find((t) => !t.cancelled && t.ms === 25);
+	assert.ok(probeTimer, "exit confirmation polling timer must be scheduled");
+
+	// If the group exits during the confirmation window:
+	groupAlive = false;
+	children[0].exit(0);
+	advance(25);
+	await tick();
+
+	assert.equal(store.get(task.id)?.status, TASK_STATUS.COMPLETED);
+	assert.equal(store.get(task.id)?.error, null);
 });
 
 test("AgentRunner classifies terminal assistant outcomes only after settlement", async () => {
@@ -1136,7 +1534,9 @@ test("AgentRunner retains permission broker fd3 and assigns messaging IPC to fd4
 	const launch = spawnOptions[0];
 	const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 	assert.match(launch?.env.GENTLE_PI_AGENTS_OWNED_IPC ?? "", /^\d+-[a-z0-9]+$/, "the owned-IPC marker has the runner's opaque shape");
-	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3", [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", TMPDIR: launch?.env.TMPDIR });
+	const scratch = launch?.env.TMPDIR;
+	const scratchEnv = process.platform === "win32" ? { TMPDIR: scratch, TMP: scratch, TEMP: scratch } : { TMPDIR: scratch };
+	assert.deepEqual(launch?.env, { GENTLE_PI_AGENTS_CHILD: "1", GENTLE_PI_AGENTS_OWNED_IPC: launch?.env.GENTLE_PI_AGENTS_OWNED_IPC, GENTLE_PI_AGENTS_PARENT_PERMISSION_FD: "3", [REQUESTED_TOOLS_ENV]: "read,grep,subagent_parent_message", ...scratchEnv });
 	assert.match(basename(launch?.env.TMPDIR ?? ""), /^ga[A-Za-z0-9]{6}$/);
 	assert.deepEqual(launch?.stdio, ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"]);
 	assert.equal(launch?.stdio?.length, 5);
@@ -2034,4 +2434,166 @@ test("advisories S2: session shutdown keeps a running or quarantined subagent's 
 	next.start();
 	assert.equal(existsSync(scratch), false, "the startup sweep removes the kept scratch once its owner ended");
 	next.shutdown();
+});
+
+const quotaEnd = { type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "429 insufficient_quota: monthly usage limit reached" }] };
+
+test("a subagent that runs out of quota switches its child to the next model in place and continues", async () => {
+	const fallbacks: Array<{ task: string; from: string; to: string; category: string }> = [];
+	const h = harness({ state: { model: { provider: "fb-a", id: "primary" } }, onFallback: (task, change) => { fallbacks.push({ task: task.id, ...change }); } });
+	const task = h.runner.run(request({ model: { provider: "fb-a", id: "primary" }, thinking: "high", fallbacks: [{ model: "fb-b/second", thinking: "medium" }, { model: "fb-c/third" }] }));
+	await tick();
+	h.children[0].emit(quotaEnd);
+	h.children[0].emit({ type: "agent_settled" });
+	await tick(); await tick(); await tick();
+	assert.notEqual(h.store.get(task.id)?.status, TASK_STATUS.FAILED, "the task is still alive");
+	const sent = h.children[0].written.map((command) => command.type);
+	assert.deepEqual(h.children[0].written.filter((command) => command.type === "set_model").map((command) => [command.provider, command.modelId]), [["fb-b", "second"]]);
+	assert.deepEqual(h.children[0].written.filter((command) => command.type === "set_thinking_level").map((command) => command.level), ["medium"]);
+	assert.ok(sent.lastIndexOf("prompt") > sent.indexOf("set_model"), "the continue prompt follows the switch");
+	assert.match(String(h.children[0].written.at(-1)?.message), /continue/i);
+	assert.equal(h.store.get(task.id)?.model, "fb-b/second");
+	assert.deepEqual(fallbacks, [{ task: task.id, from: "fb-a/primary", to: "fb-b/second", category: "quota" }]);
+	assert.equal(h.spawnOptions.length, 1, "the same child keeps going");
+	h.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [{ type: "text", text: "done on the fallback" }], stopReason: "stop" }] });
+	h.children[0].emit({ type: "agent_settled" });
+	const done = await h.runner.waitFor(task.id);
+	assert.equal(done.status, TASK_STATUS.COMPLETED);
+	assert.equal(done.result, "done on the fallback");
+});
+
+test("errors another model would repeat, or an exhausted chain, fail the subagent as before", async () => {
+	const context = harness({ state: {} });
+	const contextTask = context.runner.run(request({ model: { provider: "fb-d", id: "one" }, fallbacks: [{ model: "fb-e/two" }] }));
+	await tick();
+	context.children[0].emit({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "error", errorMessage: "prompt is too long: maximum context length" }] });
+	context.children[0].emit({ type: "agent_settled" });
+	const failed = await context.runner.waitFor(contextTask.id);
+	assert.equal(failed.status, TASK_STATUS.FAILED);
+	assert.equal(context.children[0].written.some((command) => command.type === "set_model"), false);
+
+	const none = harness({ state: {} });
+	const noneTask = none.runner.run(request({ model: { provider: "fb-f", id: "only" } }));
+	await tick();
+	none.children[0].emit(quotaEnd);
+	none.children[0].emit({ type: "agent_settled" });
+	assert.equal((await none.runner.waitFor(noneTask.id)).status, TASK_STATUS.FAILED, "no chain, no fallback");
+
+	const spent = harness({ state: {} });
+	const spentTask = spent.runner.run(request({ model: { provider: "fb-g", id: "one" }, fallbacks: [{ model: "fb-h/two" }] }));
+	await tick();
+	spent.children[0].emit(quotaEnd);
+	spent.children[0].emit({ type: "agent_settled" });
+	await tick(); await tick(); await tick();
+	spent.children[0].emit(quotaEnd);
+	spent.children[0].emit({ type: "agent_settled" });
+	const exhausted = await spent.runner.waitFor(spentTask.id);
+	assert.equal(exhausted.status, TASK_STATUS.FAILED, "the last model failing ends the task");
+	assert.match(exhausted.error ?? "", /quota/);
+	assert.equal(spent.children[0].written.filter((command) => command.type === "set_model").length, 1);
+});
+
+test("a launch whose primary model is cooling down starts on the first usable fallback", async () => {
+	const first = harness({ state: {} });
+	const task = first.runner.run(request({ model: { provider: "fb-i", id: "cool" }, fallbacks: [{ model: "fb-j/warm" }] }));
+	await tick();
+	first.children[0].emit(quotaEnd);
+	first.children[0].emit({ type: "agent_settled" });
+	await tick(); await tick();
+	const next = harness({ state: {} });
+	next.runner.run(request({ model: { provider: "fb-i", id: "cool" }, thinking: "low", fallbacks: [{ model: "fb-j/warm", thinking: "high" }] }));
+	await tick();
+	const args = next.spawnOptions[0]!.args;
+	assert.equal(args[args.indexOf("--model") + 1], "fb-j/warm:high", "the cooled primary is skipped at launch");
+	assert.ok(task.id);
+});
+
+test("a fallback Pi refuses (no key, unknown model) gives way to the next one, and only the model actually used is announced", async () => {
+	const announced: string[] = [];
+	const h = harness({ state: {}, reject: (command) => command.type === "set_model" && command.provider === "fb-l", onFallback: (_task, change) => { announced.push(`${change.from}->${change.to}`); } });
+	const task = h.runner.run(request({ model: { provider: "fb-k", id: "one" }, fallbacks: [{ model: "fb-l/two" }, { model: "fb-m/three" }] }));
+	await tick();
+	h.children[0].emit(quotaEnd);
+	h.children[0].emit({ type: "agent_settled" });
+	for (let i = 0; i < 6; i++) await tick();
+	assert.deepEqual(h.children[0].written.filter((command) => command.type === "set_model").map((command) => `${command.provider}/${command.modelId}`), ["fb-l/two", "fb-m/three"]);
+	assert.deepEqual(announced, ["fb-k/one->fb-m/three"]);
+	assert.equal(h.store.get(task.id)?.model, "fb-m/three");
+	assert.notEqual(h.store.get(task.id)?.status, TASK_STATUS.FAILED);
+	const none = harness({ state: {}, reject: (command) => command.type === "set_model" });
+	const lost = none.runner.run(request({ model: { provider: "fb-n", id: "one" }, fallbacks: [{ model: "fb-o/two" }] }));
+	await tick();
+	none.children[0].emit(quotaEnd);
+	none.children[0].emit({ type: "agent_settled" });
+	const failed = await none.runner.waitFor(lost.id);
+	assert.equal(failed.status, TASK_STATUS.FAILED);
+	assert.match(failed.error ?? "", /could not switch to fb-o\/two: No API key/);
+});
+
+test("starting on a fallback because the primary is cooling down is announced like any other switch", async () => {
+	const first = harness({ state: {} });
+	first.runner.run(request({ model: { provider: "fb-p", id: "cool" }, fallbacks: [{ model: "fb-q/warm" }] }));
+	await tick();
+	first.children[0].emit(quotaEnd);
+	first.children[0].emit({ type: "agent_settled" });
+	await tick(); await tick();
+	const announced: Array<{ from: string; to: string; category: string; launch?: boolean }> = [];
+	const next = harness({ state: {}, onFallback: (_task, change) => { announced.push(change); } });
+	next.runner.run(request({ model: { provider: "fb-p", id: "cool" }, fallbacks: [{ model: "fb-q/warm" }] }));
+	await tick();
+	assert.deepEqual(announced, [{ from: "fb-p/cool", to: "fb-q/warm", category: "quota", launch: true }]);
+});
+
+test("the task record remembers the model a fallback moved away from", async () => {
+	const h = harness({ state: {} });
+	const task = h.runner.run(request({ model: { provider: "fb-r", id: "one" }, fallbacks: [{ model: "fb-s/two" }] }));
+	await tick();
+	h.children[0].emit(quotaEnd);
+	h.children[0].emit({ type: "agent_settled" });
+	for (let i = 0; i < 4; i++) await tick();
+	assert.equal(h.store.get(task.id)?.fallbackFrom, "fb-r/one");
+	assert.equal(h.store.get(task.id)?.model, "fb-s/two");
+});
+
+test("a fallback step without its own effort runs at the agent's configured effort", async () => {
+	const h = harness({ state: {} });
+	h.runner.run(request({ model: { provider: "fb-u", id: "one" }, thinking: "high", fallbacks: [{ model: "fb-v/two", thinking: "low" }, { model: "fb-w/three" }] }));
+	await tick();
+	for (let round = 0; round < 2; round++) {
+		h.children[0].emit(quotaEnd);
+		h.children[0].emit({ type: "agent_settled" });
+		for (let i = 0; i < 6; i++) await tick();
+	}
+	assert.deepEqual(h.children[0].written.filter((command) => command.type === "set_thinking_level").map((command) => command.level), ["low", "high"]);
+});
+
+test("a launch fallback is announced only once the child actually started", async () => {
+	const first = harness({ state: {} });
+	first.runner.run(request({ model: { provider: "fb-x", id: "cool" }, fallbacks: [{ model: "fb-y/warm" }] }));
+	await tick();
+	first.children[0].emit(quotaEnd);
+	first.children[0].emit({ type: "agent_settled" });
+	await tick(); await tick();
+	const announced: string[] = [];
+	const failing = harness({ failStart: true, onFallback: (_task, change) => { announced.push(change.to); } });
+	const task = failing.runner.run(request({ model: { provider: "fb-x", id: "cool" }, fallbacks: [{ model: "fb-y/warm" }] }));
+	await failing.runner.waitFor(task.id);
+	assert.deepEqual(announced, [], "a spawn that failed announces nothing");
+	const starting = harness({ state: {}, onFallback: (_task, change) => { announced.push(change.to); } });
+	starting.runner.run(request({ model: { provider: "fb-x", id: "cool" }, fallbacks: [{ model: "fb-y/warm" }] }));
+	await tick();
+	assert.deepEqual(announced, ["fb-y/warm"]);
+});
+
+test("a task cancelled after Pi accepted the new model records that model", async () => {
+	const h = harness({ state: {}, hold: (command) => command.type === "set_thinking_level" });
+	const task = h.runner.run(request({ model: { provider: "fb-z", id: "one" }, fallbacks: [{ model: "fb-za/two", thinking: "low" }] }));
+	await tick();
+	h.children[0].emit(quotaEnd);
+	h.children[0].emit({ type: "agent_settled" });
+	for (let i = 0; i < 4; i++) await tick();
+	h.runner.cancel(task.id);
+	const done = await h.runner.waitFor(task.id);
+	assert.equal(done.model, "fb-za/two");
+	assert.equal(done.fallbackFrom, "fb-z/one");
 });

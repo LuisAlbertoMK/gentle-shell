@@ -1,4 +1,5 @@
 import type { ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import type { OrchestratorMode } from "./agent-profiles.ts";
 
 // Harness roadmap R1: the parent-context backstop was a fixed "~150k tokens" in
 // prompt text, so the model had to estimate its own context. The runtime now
@@ -12,6 +13,9 @@ export const CONTEXT_BACKSTOP_TOKENS = 150_000;
 export const CONTEXT_BACKSTOP_FRACTION = 0.15;
 export const CONTEXT_BACKSTOP_TOKENS_ENV = "GENTLE_PI_CONTEXT_BACKSTOP_TOKENS";
 export const CONTEXT_BACKSTOP_FRACTION_ENV = "GENTLE_PI_CONTEXT_BACKSTOP_FRACTION";
+// Sampling window for the measured context (see createThrottledContextMeasure).
+export const CONTEXT_BACKSTOP_MEASURE_MS_ENV = "GENTLE_PI_CONTEXT_BACKSTOP_MEASURE_MS";
+export const CONTEXT_BACKSTOP_MEASURE_MS_DEFAULT = 5_000;
 
 /** The part of Pi's `ctx.getContextUsage()` the backstop reads; null tokens are unknown (e.g. right after compaction). */
 export interface MeasuredContext {
@@ -45,18 +49,26 @@ export function contextBackstopReached(usage: MeasuredContext | undefined, env: 
 
 const count = (value: number) => Math.round(value).toLocaleString("en-US");
 
-function contextBackstopNotice(tokens: number, contextWindow: number | null | undefined, threshold: number): string {
+function contextBackstopNotice(tokens: number, contextWindow: number | null | undefined, threshold: number, fullDelegation: boolean): string {
 	const share = positive(contextWindow) ? ` (${Math.round((tokens / contextWindow) * 100)}% of the ${count(contextWindow)}-token context window)` : "";
-	return `Context backstop: the parent context measures ${count(tokens)} tokens${share}, at or past the ${count(threshold)}-token backstop: delegate the next bounded unit that needs several steps (its reads, edits, and checks) with a short handoff, while single small edits and state checks stay inline.`;
+	// In full delegation mode no edit stays with the parent, whatever its size, so the
+	// organic carve-out for small edits would contradict the session's own rules.
+	const tail = fullDelegation
+		? "delegate the next bounded unit with a short handoff, and keep only state checks in this context."
+		: "delegate the next bounded unit that needs several steps (its reads, edits, and checks) with a short handoff, while single small edits and state checks stay inline.";
+	return `Context backstop: the parent context measures ${count(tokens)} tokens${share}, at or past the ${count(threshold)}-token backstop: ${tail}`;
 }
 
 /**
  * One notice per crossing for each session: the first measurement at or past the backstop returns it, and a
  * measurement below the backstop re-arms it (for example after compaction). Unknown tokens change nothing.
  */
-export function createContextBackstopSignal(env: Env = process.env): (session: unknown, usage: MeasuredContext | undefined) => string | undefined {
+export function createContextBackstopSignal(
+	env: Env = process.env,
+): (session: unknown, usage: MeasuredContext | undefined, mode?: () => OrchestratorMode) => string | undefined {
 	const notified = new Set<unknown>();
-	return (session, usage) => {
+	// `mode` is a thunk: it is read only when a notice is emitted, never on every measurement.
+	return (session, usage, mode) => {
 		if (typeof usage?.tokens !== "number") return undefined;
 		const threshold = contextBackstopThreshold(usage.contextWindow, env);
 		if (usage.tokens < threshold) {
@@ -65,7 +77,40 @@ export function createContextBackstopSignal(env: Env = process.env): (session: u
 		}
 		if (notified.has(session)) return undefined;
 		notified.add(session);
-		return contextBackstopNotice(usage.tokens, usage.contextWindow, threshold);
+		return contextBackstopNotice(usage.tokens, usage.contextWindow, threshold, mode?.() === "full-delegation");
+	};
+}
+
+export interface ThrottledContextMeasureOptions {
+	now?: () => number;
+	/** Injected window in ms; 0 samples on every call (tests). Omitted resolves the env, then the 5 s default. */
+	minIntervalMs?: number;
+	env?: Env;
+}
+
+/**
+ * One measured context per session per window. `ctx.getContextUsage()` rebuilds the whole session projection
+ * (O(session) per call), so the backstop samples it instead of paying that on every tool result. The first
+ * sample of a session is immediate — a resumed session already past the backstop must not wait a window — and
+ * every call inside the window skips the measurement entirely, so the backstop sees `undefined` (unknown
+ * tokens change nothing). A throwing measure returns `undefined`; the failed attempt still consumed its
+ * window, so a persistently failing host cannot turn every tool result into a retry.
+ */
+export function createThrottledContextMeasure(options: ThrottledContextMeasureOptions = {}): (session: unknown, measure: () => MeasuredContext | undefined) => MeasuredContext | undefined {
+	const now = options.now ?? (() => Date.now());
+	const env = options.env ?? process.env;
+	const minIntervalMs = options.minIntervalMs ?? envNumber(env, CONTEXT_BACKSTOP_MEASURE_MS_ENV, positive, CONTEXT_BACKSTOP_MEASURE_MS_DEFAULT);
+	const lastMeasuredAt = new Map<unknown, number>();
+	return (session, measure) => {
+		const previous = lastMeasuredAt.get(session);
+		const at = now();
+		if (previous !== undefined && at - previous < minIntervalMs) return undefined;
+		lastMeasuredAt.set(session, at);
+		try {
+			return measure();
+		} catch {
+			return undefined;
+		}
 	};
 }
 
