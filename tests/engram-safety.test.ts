@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
 import * as shell from "../lib/gentle-shell-bundled.ts";
+import { engramPinVersion } from "../scripts/installer-downloads.mjs";
 
 const repository = dirname(dirname(fileURLToPath(import.meta.url)));
 const GUARD = join(repository, "bin", "engram-guard");
@@ -16,7 +17,7 @@ const OTHER_ID = "fedcba9876543210fedcba9876543210";
 const READY = { revision: 1, source: "active", status: "ready", offline_automatic_opening_authorized: false, active_reuse_authorized: true,
 	instance_id: ID, runtime_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", capability: "startup-verified-store-v1" };
 const REFUSED: shell.EngramProbe = { kind: "refused" };
-const CORE = "3.5.2";
+const CORE = "3.7.0";
 const listening = (compatible: boolean, healthInstanceId?: string, healthVersion = CORE): shell.EngramProbe =>
 	({ kind: "listening", compatible, healthInstanceId, healthVersion: healthInstanceId === undefined ? undefined : healthVersion });
 
@@ -246,11 +247,16 @@ test("the header is a newer-schema tripwire against the verified bundled schema,
 	assert.equal(shell.bundledEngramSchema("3.3.2"), 1);
 	assert.equal(shell.bundledEngramSchema("3.4.0"), 1);
 	assert.equal(shell.bundledEngramSchema("3.5.2"), 1);
+	assert.equal(shell.bundledEngramSchema("3.7.0"), 1);
 	assert.equal(shell.bundledEngramSchema("3.3.3"), undefined);
 	for (const userVersion of [0, 1]) assert.equal(shell.engramHeaderAllows(userVersion, 1), true, String(userVersion));
 	assert.equal(shell.engramHeaderAllows(2, 1), false);
 	assert.equal(shell.engramHeaderAllows(undefined, 1), false);
 	assert.equal(shell.engramHeaderAllows(0, undefined), false);
+});
+
+test("the bundled Engram pin has a verified schema entry, so the header tripwire never falls back to unavailable", () => {
+	assert.equal(shell.bundledEngramSchema(engramPinVersion), 1);
 });
 
 function listen(t: TestContext, handler: (path: string, response: import("node:http").ServerResponse) => void): Promise<number> {
@@ -312,7 +318,7 @@ test("probe reports refused for a closed port and unknown for a silent listener"
 	assert.ok(Date.now() - started < 2000);
 });
 
-const base = { node: "/node", cli: "/pi", prefix: "/prefix", engram: "/prefix/runtime/engram-3.5.2/engram", guard: GUARD };
+const base = { node: "/node", cli: "/pi", prefix: "/prefix", engram: "/prefix/runtime/engram-3.7.0/engram", guard: GUARD };
 
 test("disabled memory without explicit selections points ENGRAM_BIN at the guard and keeps the policy", () => {
 	const memory = classify({ endpoint: listening(false) });

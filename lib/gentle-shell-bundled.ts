@@ -410,9 +410,9 @@ export function parseEngramProvenance(text: string | undefined): EngramProvenanc
 }
 
 // The bundled core's own schema (SQLite user_version), verified from the
-// tagged sources v3.3.2, v3.4.0 and v3.5.2: internal/store/store.go `const schemaVersion = 1`.
+// tagged sources v3.3.2, v3.4.0, v3.5.2 and v3.7.0: internal/store/store.go `const schemaVersion = 1`.
 // A pin without a verified entry leaves the header check unavailable.
-const BUNDLED_ENGRAM_SCHEMA: Record<string, number> = { "3.3.2": 1, "3.4.0": 1, "3.5.2": 1 };
+const BUNDLED_ENGRAM_SCHEMA: Record<string, number> = { "3.3.2": 1, "3.4.0": 1, "3.5.2": 1, "3.7.0": 1 };
 
 export function bundledEngramSchema(coreVersion: string): number | undefined {
 	return Object.hasOwn(BUNDLED_ENGRAM_SCHEMA, coreVersion) ? BUNDLED_ENGRAM_SCHEMA[coreVersion] : undefined;
